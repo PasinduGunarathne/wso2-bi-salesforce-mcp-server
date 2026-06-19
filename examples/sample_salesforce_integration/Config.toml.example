@@ -1,0 +1,23 @@
+# Copy this file to Config.toml and fill in your Salesforce Connected App credentials.
+# Config.toml is gitignored — never commit real credentials.
+
+# OAuth2 Connected App credentials
+clientId     = "3MVG9..."
+clientSecret = "...."
+refreshToken = "5Aep..."
+
+# Token endpoint. Use https://test.salesforce.com/services/oauth2/token for sandboxes.
+refreshUrl   = "https://login.salesforce.com/services/oauth2/token"
+
+# Your org's instance URL (the value of `instance_url` returned by the token endpoint).
+baseUrl      = "https://myorg.my.salesforce.com"
+
+# Salesforce REST API version. Match what the MCP server (constants.ts) targets.
+apiVersion   = "62.0"
+
+# Local HTTP service port for the publishing flow.
+servicePort  = 9090
+
+# Optional retry policy for transient Salesforce errors.
+maxRetries        = 3
+retryBackoffMs    = 500
