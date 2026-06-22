@@ -38,20 +38,41 @@ export function generateConfigToml(
   refreshToken: string,
   baseUrl: string,
   port: number = DEFAULT_SERVICE_PORT,
-  sandbox = false
+  sandbox = false,
+  orgName = "wso2bi",
+  packageName = "salesforce_integration",
+  includePort = true
 ): string {
-  const refreshUrl =
-    (sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL) + "/services/oauth2/token";
+  // Refresh tokens are bound to the host that issued them. The OAuth authorize
+  // + code exchange run against the org's My Domain host (baseUrl), so the
+  // connector must refresh at THAT same host — refreshing a My Domain token at
+  // login.salesforce.com returns invalid_grant ("expired access/refresh token"),
+  // which silently breaks the CDC listeners on first use. Derive the token
+  // endpoint from baseUrl; fall back to the login/test host only if baseUrl
+  // can't be parsed.
+  let refreshUrl;
+  try {
+    refreshUrl = new URL(baseUrl).origin + "/services/oauth2/token";
+  } catch {
+    refreshUrl =
+      (sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL) + "/services/oauth2/token";
+  }
+
+  // apiVersion / servicePort only matter for the REST API (sfClient + http
+  // listener). A portless CDC-only project declares neither configurable, so
+  // omitting them here avoids "unmatched configuration" warnings at startup.
+  const restConfig = includePort
+    ? `apiVersion   = "${SF_API_VERSION}"\nservicePort  = ${port}\n`
+    : "";
 
   return `# Salesforce OAuth2 credentials — do NOT commit this file to version control
+[${orgName}.${packageName}]
 clientId     = "${escapeToml(clientId)}"
 clientSecret = "${escapeToml(clientSecret)}"
 refreshToken = "${escapeToml(stripNewlines(refreshToken))}"
 refreshUrl   = "${refreshUrl}"
 baseUrl      = "${escapeToml(baseUrl)}"
-apiVersion   = "${SF_API_VERSION}"
-servicePort  = ${port}
-`;
+${restConfig}`;
 }
 
 // ─── .gitignore ───────────────────────────────────────────────────────────────
@@ -169,8 +190,42 @@ export function generateMainBal(
   orgName: string,
   packageName: string,
   objectNames: string[],
-  servicePort: number = DEFAULT_SERVICE_PORT
+  servicePort: number = DEFAULT_SERVICE_PORT,
+  restApi: boolean = true
 ): string {
+  // ── CDC-only (portless) variant ──────────────────────────────────────────
+  // No http:Listener, no REST service, no sfClient — just the configurable
+  // credentials the salesforce:Listener instances (cdc_*.bal) read at startup.
+  // The CDC listeners themselves keep the runtime alive; no port is bound, so
+  // there is no "Address already in use" failure mode.
+  if (!restApi) {
+    return `import ballerina/log;
+import ballerina/os;
+
+// ── Configurable variables (Config.toml or env vars) ────────────────────────
+// Shared by every salesforce:Listener declared in the cdc_*.bal files.
+configurable string clientId     = os:getEnv("SF_CLIENT_ID");
+configurable string clientSecret = os:getEnv("SF_CLIENT_SECRET");
+configurable string refreshToken = os:getEnv("SF_REFRESH_TOKEN");
+configurable string refreshUrl   = os:getEnv("SF_REFRESH_URL");
+configurable string baseUrl      = os:getEnv("SF_BASE_URL");
+
+// ── Startup validation ───────────────────────────────────────────────────────
+// Fail fast with a clear message if credentials are missing, instead of
+// surfacing an opaque connector error when the CDC listeners start.
+function init() returns error? {
+    if clientId == "" || clientSecret == "" || refreshToken == "" || baseUrl == "" {
+        return error("Missing Salesforce credentials. Set them in Config.toml or via " +
+            "env vars: SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REFRESH_TOKEN, SF_BASE_URL.");
+    }
+    log:printInfo("Salesforce CDC integration starting. If the listeners show " +
+        "invalid_grant, visit http://localhost:${servicePort}/auth/reauth to " +
+        "reauthorize without a restart.", baseUrl = baseUrl);
+}
+`;
+  }
+
+  // ── REST API variant (default) ───────────────────────────────────────────
   // We always import the types submodule — it's harmless if unused, and
   // keeps the file consistent across standard/custom mixes.
   const hasPrebuilt = objectNames.some((o) => !isCustomObject(o));
@@ -222,29 +277,51 @@ configurable int    servicePort  = ${servicePort};
 // ── Startup validation ───────────────────────────────────────────────────────
 // Fail fast with a clear message if credentials are missing, instead of
 // surfacing an opaque connector error on the first request.
+// ── Salesforce client ────────────────────────────────────────────────────────
+// sfClient uses a Bearer-token placeholder at module-level startup so that the
+// service can launch even when the OAuth2 refresh token is expired. Ballerina's
+// http module (2.16+) eagerly validates OAuth2 credentials on http:Client
+// construction; using a Bearer placeholder avoids that network round-trip.
+// auth_recovery.bal replaces sfClient with a real OAuth2 client once the user
+// completes the authorization code flow via GET /auth/callback.
+salesforce:Client sfClient = check new ({
+    baseUrl: baseUrl == "" ? "https://placeholder.salesforce.com" : baseUrl,
+    auth: <http:BearerTokenConfig>{token: "pending-oauth2-reauth"},
+    apiVersion: apiVersion
+});
+
+// ── Startup validation ───────────────────────────────────────────────────────
 function init() returns error? {
     if clientId == "" || clientSecret == "" || refreshToken == "" || baseUrl == "" {
         return error("Missing Salesforce credentials. Set them in Config.toml or via " +
-            "env vars: SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REFRESH_TOKEN, SF_BASE_URL " +
-            "(refreshUrl optional — defaults to login.salesforce.com).");
+            "env vars: SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REFRESH_TOKEN, SF_BASE_URL.");
     }
-    log:printInfo("Starting Salesforce integration", servicePort = servicePort, baseUrl = baseUrl);
+    // Publisher flow: swap the startup placeholder for a real OAuth2 refresh-token
+    // client so the REST CRUD routes authenticate immediately with the configured
+    // token. Done here (not at module level) so an expired token degrades to a
+    // clear log + /auth/reauth recovery instead of crashing the launch.
+    salesforce:Client|error publisher = new ({
+        baseUrl: baseUrl,
+        auth: <http:OAuth2RefreshTokenGrantConfig>{
+            clientId:     clientId,
+            clientSecret: clientSecret,
+            refreshToken: refreshToken,
+            refreshUrl:   refreshUrl
+        },
+        apiVersion: apiVersion
+    });
+    if publisher is salesforce:Client {
+        sfClient = publisher;
+        log:printInfo("Publisher sfClient initialised with OAuth2 refresh-token credentials");
+    } else {
+        log:printWarn("Publisher sfClient could not authenticate at startup (refresh token " +
+            "may be expired). REST CRUD will fail until you visit http://localhost:" +
+            servicePort.toString() + "/auth/reauth.", 'error = publisher);
+    }
+    log:printInfo("Salesforce integration starting — if CDC listeners or REST calls show " +
+        "invalid_grant, visit http://localhost:" + servicePort.toString() +
+        "/auth/reauth to reauthorize.", servicePort = servicePort, baseUrl = baseUrl);
 }
-
-// ── Salesforce client ────────────────────────────────────────────────────────
-
-final salesforce:ConnectionConfig sfConfig = {
-    baseUrl: baseUrl,
-    auth: {
-        clientId:     clientId,
-        clientSecret: clientSecret,
-        refreshToken: refreshToken,
-        refreshUrl:   refreshUrl
-    },
-    apiVersion: apiVersion
-};
-
-final salesforce:Client sfClient = check new (sfConfig);
 
 // ── HTTP listener ────────────────────────────────────────────────────────────
 listener http:Listener httpListener = new (servicePort);
@@ -263,14 +340,19 @@ ${routes}
 }
 
 /**
- * Per-object CRUD file. Lives in the same default module as main.bal,
- * so the shared `sfClient` and `sftypes:` import are visible.
+ * Per-object CRUD file. Lives in the same default module as main.bal, so the
+ * module-level `sfClient` is visible. Imports, however, are file-scoped in
+ * Ballerina, so the `sftypes` import is re-declared here when needed.
  */
 export function generateObjectModule(objectName: string): string {
   const { prebuilt, typeRef } = recordTypeFor(objectName);
   const fnSuffix = safeId(objectName);
+  // Imports in Ballerina are file-scoped, not module-scoped — every file that
+  // references `sftypes:` must import the submodule itself. main.bal importing
+  // it does NOT make it visible here. Custom-object types live in types.bal in
+  // this same default module, so they need no import.
   const typesImport = prebuilt
-    ? "// Uses pre-built record type from ballerinax/salesforce.types (imported in main.bal)."
+    ? "import ballerinax/salesforce.types as sftypes;\n// Uses pre-built record type from ballerinax/salesforce.types."
     : "// Uses generated custom record type defined in types.bal.";
 
   return `// ── ${objectName} CRUD operations ───────────────────────────────────────────
@@ -354,31 +436,78 @@ export function generateCdcListener(opts: CdcListenerOptions): {
   const label = opts.allChanges ? "AllChangeEvents" : opts.sobject!;
   const filename = `cdc_${snakeCase(label)}.bal`;
 
-  const callbacks = events
-    .map(
-      (e) => `    remote function ${e}(salesforce:EventData event) returns error? {
-        log:printInfo("${label} ${e}", event = event);
-    }`
-    )
+  // Callback bodies show how to access changedData — CDC payloads only include
+  // the fields that actually changed, plus always-present header fields (Id, etc.).
+  const callbackBodies: Record<string, string> = {
+    onCreate: [
+      `        map<json> changedData = event.changedData;`,
+      `        log:printInfo("[${label}] record created", payload = changedData.toJson());`,
+      `        // TODO: implement your create-event business logic`,
+    ].join("\n"),
+    onUpdate: [
+      `        map<json> changedData = event.changedData;`,
+      `        log:printInfo("[${label}] record updated", payload = changedData.toJson());`,
+      `        // TODO: only changed fields are present in changedData — check before accessing`,
+    ].join("\n"),
+    onDelete: [
+      `        // Delete events carry no changed fields — the deleted record's ID is`,
+      `        // in the ChangeEventHeader (event.metadata.recordId), not changedData.`,
+      `        string? recordId = event.metadata?.recordId;`,
+      `        log:printInfo("[${label}] record deleted", recordId = recordId);`,
+      `        // TODO: implement your delete-event business logic`,
+    ].join("\n"),
+    onRestore: [
+      `        string? recordId = event.metadata?.recordId;`,
+      `        log:printInfo("[${label}] record restored", recordId = recordId);`,
+      `        // TODO: implement your restore-event business logic`,
+    ].join("\n"),
+  };
+
+  // The salesforce:Service object type requires ALL four remote methods
+  // (onCreate/onUpdate/onDelete/onRestore) — omitting any one fails compilation
+  // with "service declaration does not implement all required constructs". So we
+  // always emit all four. `events` only chooses which ones get the richer,
+  // business-logic-ready body; the rest get a minimal no-op stub.
+  const ALL_EVENTS: CdcEventType[] = ["onCreate", "onUpdate", "onDelete", "onRestore"];
+  const selected = new Set(events);
+  const callbacks = ALL_EVENTS
+    .map((e) => {
+      const body = selected.has(e)
+        ? callbackBodies[e]
+        : `        // Not selected at scaffold time. Salesforce CDC requires a handler for
+        // every event type, so this is a no-op stub — add logic if you start
+        // handling ${e} events.
+        log:printDebug("[${label}] ${e} (unhandled)", event = event);`;
+      return `    remote function ${e}(salesforce:EventData event) returns error? {
+${body}
+    }`;
+    })
     .join("\n\n");
 
+  // The channel name is part of the service path, not the listener config.
+  // A separate salesforce:Listener instance is required per channel when OAuth2
+  // coordination is active (each listener manages one CometD subscription).
+  const configVar = `cdcConfig_${safeId(label)}`;
   const content = `// ── CDC listener for ${channel} ─────────────────────────
+import ballerina/http;
 import ballerina/log;
 import ballerinax/salesforce;
 
-// Reuses the OAuth2 credentials configured in main.bal (clientId/secret/refreshToken/refreshUrl/baseUrl).
-listener salesforce:Listener ${cdcListenerVar(label)} = new ({
-    auth: {
+// Reuses the OAuth2 credentials from main.bal (clientId/secret/refreshToken/refreshUrl/baseUrl).
+// The explicit <http:OAuth2RefreshTokenGrantConfig> cast resolves the OAuth2Config union type.
+salesforce:RestBasedListenerConfig ${configVar} = {
+    auth: <http:OAuth2RefreshTokenGrantConfig>{
         clientId:     clientId,
         clientSecret: clientSecret,
         refreshToken: refreshToken,
         refreshUrl:   refreshUrl
     },
-    baseUrl: baseUrl,
-    channelName: "${channel}"
-});
+    baseUrl: baseUrl
+};
 
-service salesforce:CdcService on ${cdcListenerVar(label)} {
+listener salesforce:Listener ${cdcListenerVar(label)} = new (${configVar});
+
+service "${channel}" on ${cdcListenerVar(label)} {
 ${callbacks}
 }
 `;
@@ -395,23 +524,27 @@ function generatePlatformEventListener(eventName: string): {
   const filename = `event_${snakeCase(eventName)}.bal`;
 
   const content = `// ── Platform Event listener for ${channel} ─────────────
+import ballerina/http;
 import ballerina/log;
 import ballerinax/salesforce;
 
-listener salesforce:Listener platformEventListener_${safeName} = new ({
-    auth: {
+salesforce:RestBasedListenerConfig platformEventConfig_${safeName} = {
+    auth: <http:OAuth2RefreshTokenGrantConfig>{
         clientId:     clientId,
         clientSecret: clientSecret,
         refreshToken: refreshToken,
         refreshUrl:   refreshUrl
     },
-    baseUrl: baseUrl,
-    channelName: "${channel}"
-});
+    baseUrl: baseUrl
+};
 
-service salesforce:PlatformEventsService on platformEventListener_${safeName} {
+listener salesforce:Listener platformEventListener_${safeName} = new (platformEventConfig_${safeName});
+
+service "${channel}" on platformEventListener_${safeName} {
     remote function onMessage(salesforce:PlatformEventsMessage event) returns error? {
-        log:printInfo("Platform event ${eventName}", event = event);
+        map<json> payload = event.payload;
+        log:printInfo("[${eventName}] platform event received", payload = payload.toJson());
+        // TODO: implement your platform event business logic
     }
 }
 `;
@@ -423,14 +556,221 @@ function cdcListenerVar(label: string): string {
   return `cdcListener_${safeId(label)}`;
 }
 
+// ─── auth_recovery.bal ────────────────────────────────────────────────────────
+
+/**
+ * Generates the OAuth2 authorization code grant recovery service.
+ * cdcListenerNames: list of CDC listener variable names (e.g. ["Account","Contact"])
+ */
+export function generateAuthRecovery(
+  cdcListenerNames: string[],
+  opts: { restApi?: boolean; port?: number } = {}
+): string {
+  const restApi = opts.restApi ?? true;
+  const port = opts.port ?? DEFAULT_SERVICE_PORT;
+
+  const applyListenerCalls = cdcListenerNames
+    .map(
+      (n) =>
+        `    _applyToListener("${n}", cdcListener_${safeId(n)}, newToken);`
+    )
+    .join("\n");
+
+  // REST projects reuse main.bal's `httpListener` and have an `sfClient` to
+  // refresh. CDC-only projects have neither — so auth_recovery binds its OWN
+  // listener (on a dedicated `reauthPort`) and skips the sfClient reinit. This
+  // is the one case where a CDC-only project binds a port; it's the cost of an
+  // in-process browser reauth endpoint.
+  const serviceHeader = restApi
+    ? `// Reuses the http:Listener and sfClient declared in main.bal.
+service /auth on httpListener {`
+    : `// CDC-only project: bind a dedicated listener purely for the reauth endpoints.
+configurable int reauthPort = ${port};
+listener http:Listener reauthListener = new (reauthPort);
+
+service /auth on reauthListener {`;
+
+  // Which port variable the redirect URIs reference.
+  const portRef = restApi ? "servicePort" : "reauthPort";
+
+  // sfClient reinit only applies to REST projects (CDC-only has no sfClient).
+  const reinitCall = restApi ? "        check _reinitSfClient(newToken);\n" : "";
+  const reinitFn = restApi
+    ? `
+// Apply the new refresh token to sfClient so REST calls use it immediately.
+function _reinitSfClient(string newToken) returns error? {
+    salesforce:Client|error newClient = new ({
+        baseUrl: baseUrl,
+        auth: <http:OAuth2RefreshTokenGrantConfig>{
+            clientId:     clientId,
+            clientSecret: clientSecret,
+            refreshToken: newToken,
+            refreshUrl:   refreshUrl
+        },
+        apiVersion: apiVersion
+    });
+    if newClient is salesforce:Client {
+        sfClient = newClient;
+        log:printInfo("sfClient reinitialised with new refresh token");
+    } else {
+        log:printError("sfClient reinit failed", 'error = newClient);
+        return newClient;
+    }
+}
+`
+    : "";
+
+  return `// ── OAuth2 Authorization Code Grant recovery ──────────────────────────────────
+// When the CDC listeners report \`invalid_grant\`, the user visits
+//   GET /auth/reauth   →  302 redirect to Salesforce login page
+//   GET /auth/callback →  receives the auth code, exchanges it for a new
+//                         refresh token, persists it to Config.toml, applies it
+//                         to all running CDC listeners${restApi ? ", and reinitialises sfClient" : ""}.
+// No service restart is required.
+//
+// One-time setup: add   http://localhost:<${portRef}>/auth/callback
+// to the Connected App's "Callback URL" list in Salesforce Setup.
+
+import ballerina/http;
+import ballerina/io;
+import ballerina/log;
+import ballerinax/salesforce;
+
+${serviceHeader}
+
+    // Redirect the browser to the Salesforce authorization page.
+    resource function get reauth(http:Caller caller, http:Request req) returns error? {
+        string redirectUri = "http://localhost:" + ${portRef}.toString() + "/auth/callback";
+        string authUrl = baseUrl + "/services/oauth2/authorize" +
+            "?response_type=code" +
+            "&client_id=" + clientId +
+            "&redirect_uri=" + redirectUri +
+            "&state=sf-reauth";
+
+        http:Response redirect = new;
+        redirect.statusCode = 302;
+        redirect.setHeader("Location", authUrl);
+        check caller->respond(redirect);
+        log:printInfo("Redirecting browser to Salesforce for reauthorization");
+    }
+
+    // Salesforce returns here with ?code=<auth_code> after the user approves.
+    resource function get callback(http:Caller caller, http:Request req) returns error? {
+        string? codeParam = req.getQueryParamValue("code");
+        if codeParam is () || codeParam == "" {
+            string desc = req.getQueryParamValue("error_description") ?: "no code returned";
+            log:printError("OAuth2 callback missing auth code: " + desc);
+            http:Response errResp = new;
+            errResp.statusCode = 400;
+            errResp.setTextPayload("Authorization failed: " + desc, "text/plain");
+            check caller->respond(errResp);
+            return;
+        }
+
+        string newToken = check _exchangeCode(codeParam);
+        log:printInfo("New refresh token obtained via authorization code exchange");
+
+        check _updateConfigFile(newToken);
+        _applyTokenToAllListeners(newToken);
+${reinitCall}
+        http:Response resp = new;
+        resp.statusCode = 200;
+        resp.setTextPayload(
+            "<html><body>" +
+            "<h2>&#x2713; Salesforce reauthorization successful</h2>" +
+            "<p>New refresh token saved to Config.toml.</p>" +
+            "<p>CDC listeners have been reconnected — no restart needed.</p>" +
+            "<p>You can close this window.</p>" +
+            "</body></html>",
+            "text/html"
+        );
+        check caller->respond(resp);
+    }
+}
+
+// Exchange an authorization code for tokens and return the new refresh token.
+function _exchangeCode(string code) returns string|error {
+    string tokenBase = _extractBase(refreshUrl);
+    string tokenPath = refreshUrl.length() > tokenBase.length()
+        ? refreshUrl.substring(tokenBase.length())
+        : "/services/oauth2/token";
+
+    string redirectUri = "http://localhost:" + ${portRef}.toString() + "/auth/callback";
+    string body = "grant_type=authorization_code" +
+        "&code=" + code +
+        "&client_id=" + clientId +
+        "&client_secret=" + clientSecret +
+        "&redirect_uri=" + redirectUri;
+
+    http:Client tokenClient = check new (tokenBase);
+    http:Response resp = check tokenClient->post(tokenPath, body,
+        {"Content-Type": "application/x-www-form-urlencoded"});
+
+    if resp.statusCode != 200 {
+        string raw = check resp.getTextPayload();
+        return error("Token exchange failed (" + resp.statusCode.toString() + "): " + raw);
+    }
+
+    json payload = check resp.getJsonPayload();
+    json rtJson = check payload.refresh_token;
+    return check rtJson.ensureType(string);
+}
+
+// Overwrite the refreshToken line in Config.toml with the new token.
+function _updateConfigFile(string newToken) returns error? {
+    string path = "./Config.toml";
+    string content = check io:fileReadString(path);
+    string updated = re \`refreshToken\\s*=\\s*"[^"]*"\`.replaceAll(
+        content, "refreshToken = \\"" + newToken + "\\""
+    );
+    check io:fileWriteString(path, updated);
+    log:printInfo("Config.toml updated with new refresh token");
+}
+${reinitFn}
+// Call updateRefreshToken + reconnect on a single CDC listener.
+function _applyToListener(string name, salesforce:Listener l, string newToken) {
+    error? e = l.updateRefreshToken(newToken);
+    if e is error {
+        log:printError("updateRefreshToken failed", listenerName = name, 'error = e);
+    }
+    error? e2 = l.reconnect();
+    if e2 is error {
+        log:printError("reconnect failed", listenerName = name, 'error = e2);
+    } else {
+        log:printInfo("CDC listener reconnected with new refresh token", listenerName = name);
+    }
+}
+
+// Apply the new token to every CDC listener declared in this module.
+function _applyTokenToAllListeners(string newToken) {
+${applyListenerCalls}
+}
+
+// Extract the scheme+host from a full URL.
+isolated function _extractBase(string uri) returns string {
+    int startIdx = uri.indexOf("://") ?: 0;
+    if startIdx > 0 {
+        startIdx = startIdx + 3;
+    }
+    int? slashIdx = uri.indexOf("/", startIdx);
+    return slashIdx is int ? uri.substring(0, slashIdx) : uri;
+}
+`;
+}
+
 // ─── README.md ────────────────────────────────────────────────────────────────
 
 export function generateReadme(
   orgName: string,
   packageName: string,
   biPath: string,
-  objectNames: string[]
+  objectNames: string[],
+  opts: { restApi?: boolean; port?: number; cdcChannels?: string[] } = {}
 ): string {
+  const restApi = opts.restApi ?? true;
+  const port = opts.port ?? DEFAULT_SERVICE_PORT;
+  const cdcChannels = opts.cdcChannels ?? [];
+
   const fileTree = objectNames
     .map((o) => `├── ${snakeCase(o)}.bal`)
     .join("\n");
@@ -444,6 +784,85 @@ export function generateReadme(
 | DELETE | /${s}/{id} | Delete a ${o} record |`;
     })
     .join("\n");
+
+  // ── Cheat-sheet sections ───────────────────────────────────────────────────
+  const first = snakeCase(objectNames[0] ?? "account");
+  const publisherSection = restApi
+    ? `## Publisher flow — REST API
+
+Create / read / update / delete Salesforce records over HTTP on **port ${port}**
+(backed by \`sfClient\`, the \`ballerinax/salesforce\` connector).
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | /health | Service health (\`{"status":"UP"}\`) |
+${endpoints}
+
+\`\`\`bash
+# list records (SOQL under the hood)
+curl http://localhost:${port}/${first}s
+
+# create
+curl -X POST http://localhost:${port}/${first} \\
+  -H 'Content-Type: application/json' -d '{"Name":"Acme Corp"}'
+
+# get one / update / delete
+curl http://localhost:${port}/${first}/<id>
+curl -X PUT http://localhost:${port}/${first}/<id> -H 'Content-Type: application/json' -d '{"Name":"New Name"}'
+curl -X DELETE http://localhost:${port}/${first}/<id>
+\`\`\`
+`
+    : `## Publisher flow
+
+Not enabled in this project (\`rest_api = false\`). This is a CDC-only build —
+see the consumer flow below. Re-scaffold with \`rest_api: true\` to add REST CRUD endpoints.
+`;
+
+  const consumerSection =
+    cdcChannels.length > 0
+      ? `## Consumer flow — Change Data Capture
+
+Receives Salesforce change events via an outbound CometD subscription (no inbound
+port). Each listener handles \`onCreate\` / \`onUpdate\` / \`onDelete\` / \`onRestore\`
+(or \`onMessage\` for platform events) — edit the handler bodies in the \`cdc_*\`/\`event_*\` files.
+
+| Channel | Listener file |
+|---------|---------------|
+${cdcChannels
+  .map((c) => {
+    const label = c.startsWith("/event/")
+      ? c.slice("/event/".length)
+      : c.startsWith("/data/") && c.endsWith("ChangeEvent")
+      ? c.slice("/data/".length, -"ChangeEvent".length)
+      : c === "/data/ChangeEvents"
+      ? "AllChangeEvents"
+      : c;
+    const file = c.startsWith("/event/")
+      ? `event_${snakeCase(label)}.bal`
+      : `cdc_${snakeCase(label)}.bal`;
+    return `| \`${c}\` | \`${file}\` |`;
+  })
+  .join("\n")}
+
+> ⚠️ Enable each object in **Salesforce Setup → Change Data Capture** first, or the
+> subscription is refused with \`403::Handshake denied\`.
+`
+      : "";
+
+  const reauthSection = `## Reauthorize (token expired)
+
+If the logs show \`invalid_grant\` or \`INVALID_SESSION_ID\`, open this once in a browser
+to mint a fresh refresh token and hot-swap it into the ${restApi ? "REST client and " : ""}CDC
+listeners — **no restart needed**:
+
+\`\`\`
+http://localhost:${port}/auth/reauth
+\`\`\`
+
+> Add \`http://localhost:${port}/auth/callback\` to the Connected App's Callback URL list.
+> **Keep Refresh Token Rotation OFF** on the Connected App if you run the publisher and CDC
+> together — they share one refresh token and rotation invalidates it.
+`;
 
   return `# ${packageName}
 
@@ -501,13 +920,9 @@ bal run
 2. **File → Open Folder** → select \`${biPath}/${packageName}\`.
 3. Click the BI icon in the Activity Bar.
 
-## Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /health | Health check |
-${endpoints}
-`;
+${publisherSection}
+${consumerSection}
+${reauthSection}`;
 }
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────

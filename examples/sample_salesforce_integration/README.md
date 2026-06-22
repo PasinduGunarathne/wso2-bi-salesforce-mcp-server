@@ -9,6 +9,30 @@ Realistic error handling is included: typed domain errors, retry-with-backoff fo
 
 ---
 
+## Endpoint cheat-sheet
+
+**Publisher (REST) — port `9090`, backed by `sfClient`:**
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | /health | Service health (`{"status":"UP"}`) |
+| GET | /accounts | List recent Account records |
+| POST | /accounts | Create an Account |
+| GET | /accounts/{id} | Get an Account by ID |
+| PUT | /accounts/{id} | Update an Account |
+| DELETE | /accounts/{id} | Delete an Account |
+
+**Consumer (events) — outbound CometD subscriptions, no inbound port:**
+
+| Channel | Listener file | Handlers |
+|---------|---------------|----------|
+| `/data/AccountChangeEvent` | `cdc_account.bal` | onCreate / onUpdate / onDelete / onRestore |
+| `/event/Sample_Event__e` | `event_sample.bal` | onMessage |
+
+> Enable Account in **Setup → Change Data Capture**, or the CDC handshake is refused with `403::Handshake denied`. Worked examples for every endpoint are in [Try the publishing flow](#try-the-publishing-flow) and [Try the consuming flow](#try-the-consuming-flow) below.
+
+---
+
 ## What's in the project
 
 ```
@@ -37,6 +61,7 @@ sample_salesforce_integration/
    - Call `sf_exchange_oauth_code` → save the `refresh_token` and `instance_url`
 4. **Change Data Capture enabled** for `Account` in Salesforce Setup → *Integrations* → *Change Data Capture* (only needed if you want the CDC listener to attach).
 5. **(Optional)** A Platform Event named `Sample_Event__e` in Salesforce Setup → *Platform Events*, or rename the channel in `event_sample.bal` to match an existing event.
+6. **Refresh Token Rotation OFF** on the Connected App — *Manage → Edit Policies → OAuth Policies* → uncheck **"Enable Refresh Token Rotation"** and set **Refresh Token Policy = "Refresh token is valid until revoked."** This sample runs the REST client **and** two event listeners, all sharing one refresh token; with rotation on they rotate it out from under each other (`invalid_grant` / `INVALID_SESSION_ID`).
 
 ---
 
@@ -213,6 +238,7 @@ This project is exactly what `sf_quickstart` would scaffold for you, plus the po
 |---|---|
 | `invalid_client` at startup | Connected App not yet active (wait 2–10 minutes after creating it) or wrong consumer key/secret. |
 | `invalid_grant` at startup | Refresh token revoked or you're using a production token against `test.salesforce.com` (or vice versa). |
+| `invalid_grant` / `INVALID_SESSION_ID` once it had worked, or only some listeners connect | **Refresh Token Rotation is ON** — disable it (Prerequisite 6). The REST client and listeners share one token; rotation invalidates it for all but the first consumer. |
 | `Resource 'AccountChangeEvent' is not enabled` | Enable CDC for Account in Salesforce Setup. |
 | `Resource '/event/Sample_Event__e' not found` | Create the Platform Event in your org, or comment out `event_sample.bal`. |
 | Port 9090 already in use | Set `servicePort = 9100` in Config.toml. |

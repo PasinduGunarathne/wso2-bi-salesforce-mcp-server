@@ -1,11 +1,13 @@
 {
   "name": "ballerina-salesforce-mcp-server",
   "version": "1.1.0",
-  "description": "MCP server for scaffolding, configuring, and deploying Ballerina + Salesforce integrations with WSO2 Integrator (BI)",
+  "description": "AI-driven MCP server that scaffolds, configures, and deploys end-to-end Ballerina + Salesforce integrations in a WSO2 Integrator (BI) workspace — 18 tools, from OAuth to a running REST service.",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "setup": "node scripts/setup.mjs",
+    "refresh-token": "node scripts/setup.mjs --refresh-only",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",

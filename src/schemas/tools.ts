@@ -70,15 +70,27 @@ const orgNameSchema = z
 export const GetOAuthAuthUrlSchema = z
   .object({
     sf_client_id: credentialFields.sf_client_id,
+    sf_base_url: credentialFields.sf_base_url
+      .optional()
+      .describe(
+        "Your org instance / My Domain URL, e.g. https://myorg.my.salesforce.com. " +
+          "Recommended: when set, the authorize URL is built against your org's own host " +
+          "(required for My Domain orgs). When omitted, falls back to login/test.salesforce.com."
+      ),
     redirect_uri: z
       .string()
       .url()
       .default("https://login.salesforce.com/services/oauth2/success")
-      .describe("Redirect URI registered in your Connected App"),
+      .describe(
+        "Redirect URI registered in your Connected App. If you pass sf_base_url and leave this " +
+          "at the default, it is automatically aligned to your org host's /services/oauth2/success."
+      ),
     sandbox: z
       .boolean()
       .default(false)
-      .describe("Use sandbox login server (test.salesforce.com) instead of login.salesforce.com"),
+      .describe(
+        "Use sandbox login server (test.salesforce.com) instead of login.salesforce.com. Ignored when sf_base_url is set."
+      ),
   })
   .strict();
 
@@ -87,15 +99,24 @@ export const ExchangeOAuthCodeSchema = z
     sf_client_id: credentialFields.sf_client_id,
     sf_client_secret: credentialFields.sf_client_secret,
     code: z.string().min(1).describe("Authorization code from the OAuth redirect"),
+    sf_base_url: credentialFields.sf_base_url
+      .optional()
+      .describe(
+        "Your org instance / My Domain URL. Recommended: a code issued by a My Domain " +
+          "authorize endpoint must be exchanged at the same host. Pass the same value used " +
+          "in sf_get_oauth_auth_url. When omitted, falls back to login/test.salesforce.com."
+      ),
     redirect_uri: z
       .string()
       .url()
       .default("https://login.salesforce.com/services/oauth2/success")
-      .describe("Same redirect URI used when generating the auth URL"),
+      .describe("Same redirect URI returned by sf_get_oauth_auth_url"),
     sandbox: z
       .boolean()
       .default(false)
-      .describe("Exchange against test.salesforce.com (sandbox) instead of login.salesforce.com"),
+      .describe(
+        "Exchange against test.salesforce.com (sandbox) instead of login.salesforce.com. Ignored when sf_base_url is set."
+      ),
   })
   .strict();
 
@@ -206,6 +227,17 @@ export const ScaffoldProjectSchema = z
       .max(65535)
       .default(DEFAULT_SERVICE_PORT)
       .describe(`HTTP listener port baked into the generated service (default: ${DEFAULT_SERVICE_PORT})`),
+    rest_api: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Generate an HTTP REST API (health + CRUD routes) bound to `port` (default: FALSE). " +
+          "Default false = CDC-only project: no http:Listener is created, so NO port is bound " +
+          "and the 'Address already in use' failure mode is impossible (requires at least one cdc_listener). " +
+          "Set true ONLY if you want HTTP CRUD/health endpoints in addition to (or instead of) CDC. " +
+          "CometD/CDC is an outbound connection and needs no inbound port — ask the user whether they " +
+          "actually need the REST API before enabling it."
+      ),
     sandbox: sandboxField,
   })
   .strict();
@@ -238,6 +270,14 @@ export const QuickstartSchema = z
         "Run 'bal build' after scaffolding to verify the project compiles. " +
           "Adds 30-90s but catches credential or version mismatches early."
       ),
+    run: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Start 'bal run' in the background after scaffolding (default: true). " +
+          "No new terminal window is opened — the service runs as a tracked child process. " +
+          "Tail logs with sf_get_project_logs and stop it with sf_stop_project (both take the returned PID)."
+      ),
     cdc_listeners: z
       .array(cdcListenerSpec)
       .optional()
@@ -251,6 +291,14 @@ export const QuickstartSchema = z
       .max(65535)
       .default(DEFAULT_SERVICE_PORT)
       .describe(`HTTP listener port (default: ${DEFAULT_SERVICE_PORT})`),
+    rest_api: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Generate an HTTP REST API (health + CRUD routes) bound to `port` (default: FALSE = CDC-only, " +
+          "no port bound, no port-collision failure mode; requires at least one cdc_listener). " +
+          "Set true ONLY if you need HTTP CRUD/health endpoints — ask the user first."
+      ),
     sandbox: sandboxField,
   })
   .strict();
@@ -381,6 +429,34 @@ export const GetTokenPasswordFlowSchema = z
   })
   .strict();
 
+export const ReauthProjectSchema = z
+  .object({
+    project_path: z
+      .string()
+      .min(1)
+      .describe("Absolute or ~-relative path to the existing Ballerina project to update"),
+    sf_client_id: credentialFields.sf_client_id,
+    sf_client_secret: credentialFields.sf_client_secret,
+    sf_base_url: credentialFields.sf_base_url.describe(
+      "Your Salesforce org instance URL, e.g. https://myorg.my.salesforce.com. " +
+        "The token exchange POST is sent to this host's /services/oauth2/token endpoint."
+    ),
+    code: z
+      .string()
+      .min(1)
+      .describe(
+        "Authorization code from the OAuth redirect — the 'code' query parameter in the browser's redirect URL"
+      ),
+    redirect_uri: z
+      .string()
+      .url()
+      .default("https://login.salesforce.com/services/oauth2/success")
+      .describe(
+        "Redirect URI registered in your Connected App. Must exactly match the value used when the auth URL was generated."
+      ),
+  })
+  .strict();
+
 export const SetupGuideSchema = z
   .object({
     sandbox: z
@@ -421,3 +497,13 @@ export type SetupGuideInput = z.infer<typeof SetupGuideSchema>;
 export type ImportPostmanCredentialsInput = z.infer<typeof ImportPostmanCredentialsSchema>;
 export type GetTokenPasswordFlowInput = z.infer<typeof GetTokenPasswordFlowSchema>;
 export type GeneratePostmanCollectionInput = z.infer<typeof GeneratePostmanCollectionSchema>;
+
+export const GetProjectLogsSchema = z
+  .object({
+    pid: z.number().int().positive().describe("PID returned by sf_deploy_project."),
+    lines: z.number().int().positive().optional().default(100).describe("Number of tail lines to return (default 100)."),
+  })
+  .strict();
+
+export type GetProjectLogsInput = z.infer<typeof GetProjectLogsSchema>;
+export type ReauthProjectInput = z.infer<typeof ReauthProjectSchema>;

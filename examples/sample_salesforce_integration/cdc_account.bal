@@ -1,3 +1,4 @@
+import ballerina/http;
 import ballerina/log;
 import ballerinax/salesforce;
 
@@ -6,23 +7,27 @@ import ballerinax/salesforce;
 // message whenever an Account is created, updated, deleted, or undeleted —
 // and this service reacts.
 //
+// The channel name is the service path below — not part of the listener config.
+// A separate salesforce:Listener instance is required per channel when OAuth2
+// coordination is active.
+//
 // Reuses the OAuth2 credentials initialised in main.bal. Errors thrown by any
 // callback are logged by the listener and the message is acknowledged so the
-// channel keeps flowing. If you need at-least-once semantics, persist failed
-// events to a durable dead-letter store inside each handler.
+// channel keeps flowing.
 
-listener salesforce:Listener accountCdcListener = new ({
-    auth: {
+salesforce:RestBasedListenerConfig accountCdcConfig = {
+    auth: <http:OAuth2RefreshTokenGrantConfig>{
         clientId:     clientId,
         clientSecret: clientSecret,
         refreshToken: refreshToken,
         refreshUrl:   refreshUrl
     },
-    baseUrl: baseUrl,
-    channelName: "/data/AccountChangeEvent"
-});
+    baseUrl: baseUrl
+};
 
-service salesforce:CdcService on accountCdcListener {
+listener salesforce:Listener accountCdcListener = new (accountCdcConfig);
+
+service "/data/AccountChangeEvent" on accountCdcListener {
 
     remote function onCreate(salesforce:EventData event) returns error? {
         do {

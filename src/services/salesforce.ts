@@ -111,7 +111,8 @@ export async function exchangeAuthCode(
   clientSecret: string,
   code: string,
   redirectUri: string,
-  sandbox = false
+  sandbox = false,
+  baseUrl?: string
 ): Promise<SalesforceOAuthCodeResponse> {
   const params = new URLSearchParams({
     grant_type: "authorization_code",
@@ -121,8 +122,20 @@ export async function exchangeAuthCode(
     redirect_uri: redirectUri,
   });
 
-  const tokenUrl =
-    (sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL) + "/services/oauth2/token";
+  // A code issued by a My Domain authorize endpoint must be redeemed at the
+  // same host. Use the org's instance host when a base URL is supplied;
+  // otherwise fall back to the generic login/test token endpoint.
+  let origin: string;
+  if (baseUrl) {
+    try {
+      origin = new URL(baseUrl).origin;
+    } catch {
+      origin = sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL;
+    }
+  } else {
+    origin = sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL;
+  }
+  const tokenUrl = `${origin}/services/oauth2/token`;
 
   try {
     const resp = await http.post<SalesforceOAuthCodeResponse>(
@@ -139,7 +152,8 @@ export async function exchangeAuthCode(
 export function buildAuthUrl(
   clientId: string,
   redirectUri: string,
-  sandbox = false
+  sandbox = false,
+  baseUrl?: string
 ): string {
   const params = new URLSearchParams({
     response_type: "code",
@@ -147,8 +161,21 @@ export function buildAuthUrl(
     redirect_uri: redirectUri,
     scope: "api refresh_token offline_access",
   });
-  const base = sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL;
-  return `${base}/services/oauth2/authorize?${params.toString()}`;
+  // Prefer the org's own instance / My Domain host as the authorize endpoint
+  // when a base URL is supplied — this is the correct host for My Domain orgs
+  // and avoids "log in via your My Domain" redirects. Falls back to the generic
+  // login/test host when no base URL is given.
+  let origin: string;
+  if (baseUrl) {
+    try {
+      origin = new URL(baseUrl).origin;
+    } catch {
+      origin = sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL;
+    }
+  } else {
+    origin = sandbox ? SF_SANDBOX_LOGIN_URL : SF_LOGIN_URL;
+  }
+  return `${origin}/services/oauth2/authorize?${params.toString()}`;
 }
 
 // ─── SObject Metadata ─────────────────────────────────────────────────────────

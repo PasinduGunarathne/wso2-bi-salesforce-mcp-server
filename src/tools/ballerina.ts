@@ -12,6 +12,7 @@ import {
   StopProjectSchema,
   CheckPrerequisitesSchema,
   SetupGuideSchema,
+  GetProjectLogsSchema,
   ScaffoldProjectInput,
   QuickstartInput,
   WriteConfigTomlInput,
@@ -22,6 +23,7 @@ import {
   StopProjectInput,
   SetupGuideInput,
   CdcListenerSpec,
+  GetProjectLogsInput,
 } from "../schemas/tools.js";
 import {
   expandPath,
@@ -33,9 +35,11 @@ import {
   fileExists,
   balBuild,
   balRun,
+  ensurePortAvailable,
   checkBalCli,
   stopBalRun,
   listLiveBalRuns,
+  getBalRunLog,
 } from "../services/filesystem.js";
 import { describeSObject, validateConnection } from "../services/salesforce.js";
 import {
@@ -47,6 +51,7 @@ import {
   generateObjectModule,
   generateReadme,
   generateCdcListener,
+  generateAuthRecovery,
   snakeCase,
   safeId,
 } from "../services/generator.js";
@@ -61,6 +66,7 @@ import {
   asStructured,
   credentialsFromParams,
   errorResult,
+  toErrorEnvelope,
   ToolError,
 } from "../types.js";
 import type { SalesforceCredentials, ToolResult } from "../types.js";
@@ -75,6 +81,7 @@ interface ScaffoldOptions {
   targetObjects: string[];
   sandbox: boolean;
   port: number;
+  restApi: boolean;
   cdcListeners?: CdcListenerSpec[];
 }
 
@@ -85,6 +92,7 @@ interface ScaffoldOutcome {
   standardObjects: string[];
   customObjects: string[];
   cdcChannels: string[];
+  restApi: boolean;
   ballerinaVersion: string;
   ballerinaVersionMatch: boolean;
   ballerinaVersionWarning: string | null;
@@ -129,6 +137,17 @@ async function scaffoldProject(opts: ScaffoldOptions): Promise<ScaffoldOutcome> 
     seen.set(id, o);
   }
 
+  // A portless (rest_api=false) project has no http:Listener, so the CDC
+  // listeners are the only thing keeping the runtime alive. Without at least
+  // one, `bal run` would init and immediately exit — refuse early.
+  if (!opts.restApi && (opts.cdcListeners?.length ?? 0) === 0) {
+    throw new ToolError(
+      "INVALID_INPUT",
+      "rest_api=false produces a CDC-only project, but no cdc_listeners were provided.",
+      "Add at least one cdc_listener (e.g. { sobject: 'Account' }), or set rest_api=true to generate the REST API."
+    );
+  }
+
   const standardObjects = opts.targetObjects.filter((o) => !isCustomObject(o));
   const customObjects = opts.targetObjects.filter(isCustomObject);
 
@@ -165,25 +184,35 @@ async function scaffoldProject(opts: ScaffoldOptions): Promise<ScaffoldOutcome> 
       opts.creds.refreshToken,
       opts.creds.baseUrl,
       opts.port,
-      opts.sandbox
+      opts.sandbox,
+      opts.orgName,
+      opts.projectName,
+      /* includePort */ opts.restApi
     ),
     /* secret */ true
   );
   await write(".gitignore", generateGitignore());
 
+  // types.bal carries custom-object record types. CDC callbacks may reference
+  // them, so write it regardless of the REST API toggle.
   const types = generateTypesFile(customDescribes);
   await write("types.bal", types.content);
 
   await write(
     "main.bal",
-    generateMainBal(opts.orgName, opts.projectName, opts.targetObjects, opts.port)
+    generateMainBal(opts.orgName, opts.projectName, opts.targetObjects, opts.port, opts.restApi)
   );
 
-  for (const objName of opts.targetObjects) {
-    await write(`${snakeCase(objName)}.bal`, generateObjectModule(objName));
+  // CRUD helper modules (account.bal, …) exist only to back the REST routes.
+  // A portless CDC-only project doesn't need them.
+  if (opts.restApi) {
+    for (const objName of opts.targetObjects) {
+      await write(`${snakeCase(objName)}.bal`, generateObjectModule(objName));
+    }
   }
 
   const cdcChannels: string[] = [];
+  const cdcListenerNames: string[] = [];
   for (const spec of opts.cdcListeners ?? []) {
     const gen = generateCdcListener({
       sobject: spec.sobject,
@@ -193,11 +222,38 @@ async function scaffoldProject(opts: ScaffoldOptions): Promise<ScaffoldOutcome> 
     });
     await write(gen.filename, gen.content);
     cdcChannels.push(channelLabel(spec));
+    // Collect the listener-variable label so auth_recovery.bal can reconnect it
+    // (matches cdcListenerVar(label) in the generator: object CDC → sobject,
+    // all-changes → "AllChangeEvents"). Platform events use a different variable
+    // name and aren't reconnected by the recovery flow, so skip them here.
+    if (spec.platform_event) {
+      // not reconnected via auth_recovery
+    } else if (spec.all_changes) {
+      cdcListenerNames.push("AllChangeEvents");
+    } else if (spec.sobject) {
+      cdcListenerNames.push(spec.sobject);
+    }
   }
+
+  // auth_recovery.bal: a browser self-reauth service (GET /auth/reauth +
+  // /auth/callback) that exchanges a new auth code, rewrites Config.toml, and
+  // hot-swaps the fresh refresh token into every CDC listener (and sfClient, for
+  // REST) with no restart. Emitted for both project shapes:
+  //   - REST:     reuses main.bal's http:Listener + sfClient.
+  //   - CDC-only: binds its own dedicated listener (the one port a CDC-only
+  //               project binds) so the reauth endpoints are reachable.
+  await write(
+    "auth_recovery.bal",
+    generateAuthRecovery(cdcListenerNames, { restApi: opts.restApi, port: opts.port })
+  );
 
   await write(
     "README.md",
-    generateReadme(opts.orgName, opts.projectName, biAbsPath, opts.targetObjects)
+    generateReadme(opts.orgName, opts.projectName, biAbsPath, opts.targetObjects, {
+      restApi: opts.restApi,
+      port: opts.port,
+      cdcChannels,
+    })
   );
 
   return {
@@ -207,6 +263,7 @@ async function scaffoldProject(opts: ScaffoldOptions): Promise<ScaffoldOutcome> 
     standardObjects,
     customObjects,
     cdcChannels,
+    restApi: opts.restApi,
     ballerinaVersion: balCheck.version,
     ballerinaVersionMatch: balCheck.versionMatch,
     ballerinaVersionWarning: balCheck.versionWarning,
@@ -408,6 +465,7 @@ All inputs except the 4 credential fields have sensible defaults:
           targetObjects: params.target_objects,
           sandbox: sandbox || conn.isSandbox,
           port: params.port,
+          restApi: params.rest_api,
           cdcListeners: params.cdc_listeners,
         });
 
@@ -417,8 +475,39 @@ All inputs except the 4 credential fields have sensible defaults:
           build = await balBuild(outcome.projectPath);
         }
 
+        // Step 4: optional background launch (detached 'bal run', no new window).
+        // Scaffolding has already succeeded here, so a busy port must NOT throw
+        // away the scaffold result — degrade to a warning and let the user free
+        // the port (or pick another) before deploying.
+        let run:
+          | { pid: number | undefined; output: string; started: boolean; logFile: string }
+          | undefined;
+        let runWarning: string | undefined;
+        if (params.run) {
+          try {
+            if (outcome.restApi) {
+              // REST project binds a port — pre-flight it, then pass the override.
+              await ensurePortAvailable(params.port);
+              run = await balRun(outcome.projectPath, params.port);
+            } else {
+              // CDC-only project binds no port; launch without a -CservicePort override.
+              run = await balRun(outcome.projectPath);
+            }
+          } catch (err) {
+            runWarning = toErrorEnvelope(err).message;
+          }
+        }
+
+        const status = build
+          ? build.success ? "ready" : "scaffold_ok_build_failed"
+          : runWarning
+          ? "scaffold_ok_port_in_use"
+          : run
+          ? run.started ? "running" : "scaffold_ok_run_unconfirmed"
+          : "scaffold_ok";
+
         const result = {
-          status: build ? (build.success ? "ready" : "scaffold_ok_build_failed") : "scaffold_ok",
+          status,
           connection: {
             org_id: conn.orgId,
             username: conn.username,
@@ -432,25 +521,40 @@ All inputs except the 4 credential fields have sensible defaults:
           cdc_channels: outcome.cdcChannels,
           ballerina_version: outcome.ballerinaVersion,
           ballerina_version_match: outcome.ballerinaVersionMatch,
-          service_port: params.port,
+          rest_api: outcome.restApi,
+          ...(outcome.restApi ? { service_port: params.port } : { mode: "cdc_only" }),
           ...(outcome.ballerinaVersionWarning
             ? { ballerina_version_warning: outcome.ballerinaVersionWarning }
             : {}),
           ...(outcome.truncationWarnings.length > 0
             ? { field_truncation_warnings: outcome.truncationWarnings }
             : {}),
-          ...(build
-            ? { build: { success: build.success, output: build.output } }
+          ...(build ? { build: { success: build.success, output: build.output } } : {}),
+          ...(run
+            ? { run: { started: run.started, pid: run.pid, log_file: run.logFile, output: run.output } }
             : {}),
-          next_steps: [
-            `1. cd "${outcome.projectPath}"`,
-            params.build && build?.success
-              ? `2. bal run   # compiled successfully, will start on port ${params.port}`
-              : `2. bal run   # starts the HTTP service on port ${params.port}`,
-            `3. Or call sf_deploy_project (port=${params.port}) to start it via MCP.`,
-            "4. Open the folder in VS Code with the Ballerina Integrator extension for the BI low-code designer.",
-            `5. Stop the service later via sf_stop_project (PID from sf_deploy_project output).`,
-          ],
+          ...(runWarning ? { run_warning: runWarning } : {}),
+          next_steps: runWarning
+            ? [
+                `1. Port ${params.port} is in use, so the service was NOT started. ${runWarning}`,
+                `2. Free the port (or stop the other process) and run sf_deploy_project for "${outcome.projectPath}".`,
+                `3. Or re-scaffold/deploy on a different port.`,
+              ]
+            : run
+            ? [
+                outcome.restApi
+                  ? `1. Service is running in the background (PID ${run.pid}) on port ${params.port}.`
+                  : `1. CDC integration is running in the background (PID ${run.pid}) — no HTTP port bound.`,
+                `2. Tail live logs: sf_get_project_logs with pid=${run.pid}; stop it: sf_stop_project with pid=${run.pid}.`,
+                `3. Open the project in VS Code with the Ballerina Integrator extension: ${outcome.projectPath}`,
+              ]
+            : [
+                `1. cd "${outcome.projectPath}"`,
+                outcome.restApi
+                  ? `2. bal run   # compiles and starts the HTTP service on port ${params.port}`
+                  : `2. bal run   # compiles and starts the CDC listeners (no HTTP port)`,
+                `3. Open the folder in VS Code with the Ballerina Integrator extension for the BI low-code designer.`,
+              ],
         };
 
         return {
@@ -509,6 +613,7 @@ Pre-conditions:
           targetObjects: params.target_objects,
           sandbox,
           port: params.port,
+          restApi: params.rest_api,
           cdcListeners: params.cdc_listeners,
         });
 
@@ -519,13 +624,16 @@ Pre-conditions:
           custom_sobjects: outcome.customObjects,
           cdc_channels: outcome.cdcChannels,
           ballerina_version: outcome.ballerinaVersion,
-          service_port: params.port,
+          rest_api: outcome.restApi,
+          ...(outcome.restApi ? { service_port: params.port } : { mode: "cdc_only" }),
           ...(outcome.truncationWarnings.length > 0
             ? { field_truncation_warnings: outcome.truncationWarnings }
             : {}),
           next_steps: [
             `1. cd "${outcome.projectPath}" && bal run`,
-            "2. Or use sf_build_project + sf_deploy_project.",
+            outcome.restApi
+              ? `2. REST API + CDC listeners start on port ${params.port}; or use sf_build_project + sf_deploy_project.`
+              : "2. CDC listeners start (no HTTP port); or use sf_build_project + sf_deploy_project.",
             "3. Open the folder in VS Code with the Ballerina Integrator extension.",
           ],
         };
@@ -566,6 +674,9 @@ from sf_base_url. File is written with mode 0600 (owner read/write only).`,
 
         const validated = validateSalesforceUrl(params.sf_base_url);
         const configPath = safeJoin(projectPath, "Config.toml");
+        const ballerinaToml = await readFile(safeJoin(projectPath, "Ballerina.toml"), "utf-8").catch(() => "");
+        const orgName = ballerinaToml.match(/^org\s*=\s*"([^"]+)"/m)?.[1] ?? "wso2bi";
+        const packageName = ballerinaToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "salesforce_integration";
         await writeSecretFile(
           configPath,
           generateConfigToml(
@@ -574,7 +685,9 @@ from sf_base_url. File is written with mode 0600 (owner read/write only).`,
             params.sf_refresh_token,
             params.sf_base_url,
             DEFAULT_SERVICE_PORT,
-            validated.isSandbox
+            validated.isSandbox,
+            orgName,
+            packageName
           )
         );
 
@@ -837,31 +950,67 @@ can pass to sf_stop_project to terminate the service later.`,
           throw new ToolError("BAL_CLI_MISSING", "'bal' CLI not found in PATH.");
         }
 
-        const runResult = await balRun(projectPath, params.port);
+        // Detect whether this is a portless CDC-only project (rest_api=false at
+        // scaffold time → no http:Listener in main.bal). If so, there is no port
+        // to pre-flight and no -CservicePort override to pass.
+        const mainBal = await readFile(path.join(projectPath, "main.bal"), "utf-8").catch(() => "");
+        const hasHttpService = mainBal.includes("http:Listener");
+
+        if (!hasHttpService) {
+          const run = await balRun(projectPath);
+          const result = {
+            started: run.started,
+            pid: run.pid,
+            mode: "cdc_only",
+            log_file: run.logFile,
+            output: run.output,
+            message: run.started
+              ? `CDC integration started in the background (PID ${run.pid}). No HTTP port is bound.`
+              : "bal run was launched but did not confirm startup within the window — check the logs.",
+            next_steps: [
+              `1. Tail live logs: sf_get_project_logs with pid=${run.pid} (look for 'Acquired leadership for Salesforce CDC channel').`,
+              `2. Stop the service: sf_stop_project with pid=${run.pid}.`,
+              `3. If you see invalid_grant, run sf_reauth_project then redeploy.`,
+            ].join("\n"),
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            structuredContent: asStructured(result),
+            isError: !run.started,
+          };
+        }
+
         const serviceUrl = `http://localhost:${params.port}`;
 
-        // Don't flag isError just because we didn't see the banner — many
-        // valid runs warm up past 20s. Only flag if the process actually exited.
-        const exited = runResult.output.includes("(process exited with code");
+        // Pre-flight the port: reclaims a stale 'bal run' WE started, but throws
+        // PRECONDITION_FAILED if an unknown process holds it (rather than killing it).
+        const { stoppedTracked } = await ensurePortAvailable(params.port);
+        const run = await balRun(projectPath, params.port);
 
         const result = {
-          pid: runResult.pid,
-          started: runResult.started,
+          started: run.started,
+          pid: run.pid,
           service_url: serviceUrl,
           health_check: `${serviceUrl}/health`,
-          output: runResult.output || "Service starting…",
-          message: runResult.started
-            ? `Service started (PID ${runResult.pid}). Try ${serviceUrl}/health. Stop later via sf_stop_project { pid: ${runResult.pid} }.`
-            : exited
-            ? "Service failed to start — see 'output'."
-            : `Service launch initiated (PID ${runResult.pid}) but startup banner not yet observed within 20s. ` +
-              `It may still come up — check ${serviceUrl}/health, or stop it via sf_stop_project { pid: ${runResult.pid} }.`,
+          log_file: run.logFile,
+          output: run.output,
+          ...(stoppedTracked.length > 0
+            ? { reclaimed_pids: stoppedTracked, reclaimed_note: `Stopped a previous service on port ${params.port} (PID ${stoppedTracked.join(", ")}) before restarting.` }
+            : {}),
+          message: run.started
+            ? `Service started in the background (PID ${run.pid}) on ${serviceUrl}.`
+            : "bal run was launched but the listener did not confirm startup within the window — check the logs.",
+          next_steps: [
+            `1. Tail live logs: sf_get_project_logs with pid=${run.pid}.`,
+            `2. Stop the service: sf_stop_project with pid=${run.pid}.`,
+            `3. Hit the health check: ${serviceUrl}/health`,
+          ].join("\n"),
         };
 
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           structuredContent: asStructured(result),
-          isError: exited,
+          isError: !run.started,
         };
       } catch (err) {
         return errorResult(err);
@@ -899,6 +1048,33 @@ current session) can be stopped — for safety we won't kill arbitrary host PIDs
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         structuredContent: asStructured(result),
         isError: !res.stopped,
+      };
+    }
+  );
+
+  // ── sf_get_project_logs ──────────────────────────────────────────────────────
+  server.registerTool(
+    "sf_get_project_logs",
+    {
+      title: "Get Live Project Logs",
+      description: `Returns the most recent log lines from a running Ballerina project started by sf_deploy_project.
+Logs are written to a temp file while the process runs. Pass the PID from sf_deploy_project or sf_list_live_projects.`,
+      inputSchema: GetProjectLogsSchema.shape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (params: GetProjectLogsInput): Promise<ToolResult> => {
+      const runs = listLiveBalRuns();
+      const tracked = runs.find((r) => r.pid === params.pid);
+      const log = await getBalRunLog(params.pid, params.lines ?? 100);
+      const result = {
+        pid: params.pid,
+        log_file: tracked?.logFile ?? `(pid ${params.pid} not tracked — may have exited)`,
+        lines_returned: log.split("\n").length,
+        log,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        structuredContent: asStructured(result),
       };
     }
   );

@@ -1,4 +1,5 @@
 import { execFile, spawn, ChildProcess } from "child_process";
+import { createWriteStream } from "fs";
 import { promisify } from "util";
 import fs from "fs/promises";
 import path from "path";
@@ -162,15 +163,29 @@ export async function balBuild(
 interface TrackedRun {
   proc: ChildProcess;
   projectPath: string;
+  logFile: string;
 }
 
 const liveBalRuns = new Map<number, TrackedRun>();
 
-export function listLiveBalRuns(): Array<{ pid: number; projectPath: string }> {
-  return Array.from(liveBalRuns.entries()).map(([pid, { projectPath }]) => ({
+export function listLiveBalRuns(): Array<{ pid: number; projectPath: string; logFile: string }> {
+  return Array.from(liveBalRuns.entries()).map(([pid, { projectPath, logFile }]) => ({
     pid,
     projectPath,
+    logFile,
   }));
+}
+
+export async function getBalRunLog(pid: number, lines = 100): Promise<string> {
+  const tracked = liveBalRuns.get(pid);
+  const logFile = tracked?.logFile ?? path.join(os.tmpdir(), `bal-run-${pid}.log`);
+  try {
+    const content = await fs.readFile(logFile, "utf-8");
+    const all = content.split("\n");
+    return all.slice(-lines).join("\n");
+  } catch {
+    return `Log file not found: ${logFile}`;
+  }
 }
 
 export function stopBalRun(pid: number): { stopped: boolean; reason: string } {
@@ -200,14 +215,137 @@ export function stopBalRun(pid: number): { stopped: boolean; reason: string } {
  * Spawn `bal run` in the background. Resolves when the listener has started,
  * the process exits early (failure), or the startup window elapses.
  */
+/**
+ * Open a new terminal window and run `bal run` inside it, so logs are fully
+ * visible to the user. On macOS we write a .command file and use `open` —
+ * Terminal.app launches it automatically. On Linux we try common emulators.
+ * Returns immediately; the terminal window runs independently.
+ */
+export async function openInTerminal(
+  projectPath: string,
+  port?: number
+): Promise<{ opened: boolean; message: string }> {
+  const portFlag = port !== undefined ? ` -- -CservicePort=${port}` : "";
+
+  if (process.platform === "darwin") {
+    // .command files are opened by Terminal.app on macOS when passed to `open`.
+    // This avoids all AppleScript quoting issues.
+    const tmpScript = path.join(os.tmpdir(), `bal-run-${Date.now()}.command`);
+    await fs.writeFile(
+      tmpScript,
+      `#!/bin/bash\ncd ${JSON.stringify(projectPath)} && bal run${portFlag}\n`,
+      { mode: 0o755 }
+    );
+    try {
+      await execFileAsync("open", [tmpScript]);
+      return {
+        opened: true,
+        message: `Opened Terminal.app — running 'bal run' in ${projectPath}. Press Ctrl+C in that window to stop.`,
+      };
+    } catch (err) {
+      return { opened: false, message: `open failed: ${String(err)}` };
+    }
+  }
+
+  if (process.platform === "linux") {
+    const cmd = `cd ${JSON.stringify(projectPath)} && bal run${portFlag}`;
+    const candidates: [string, string[]][] = [
+      ["gnome-terminal", ["--", "bash", "-c", `${cmd}; exec bash`]],
+      ["xterm", ["-e", `bash -c '${cmd}; exec bash'`]],
+      ["konsole", ["-e", `bash -c '${cmd}; exec bash'`]],
+    ];
+    for (const [bin, args] of candidates) {
+      try {
+        spawn(bin, args, { detached: true, stdio: "ignore" }).unref();
+        return { opened: true, message: `Opened ${bin} running 'bal run' in ${projectPath}.` };
+      } catch { /* try next */ }
+    }
+    return { opened: false, message: "No terminal emulator found. Run 'bal run' manually." };
+  }
+
+  return {
+    opened: false,
+    message: `Platform '${process.platform}' not supported for terminal launch. Run 'cd ${projectPath} && bal run${portFlag}' manually.`,
+  };
+}
+
+/**
+ * Return the PIDs of every process currently bound to `port`.
+ * Empty array means the port is free. Best-effort: relies on `lsof`, which
+ * exits non-zero (→ empty) when nothing owns the port.
+ */
+export async function getPortHolders(port: number): Promise<number[]> {
+  try {
+    // lsof -ti:<port> prints PIDs of processes bound to the port, one per line.
+    const { stdout } = await execFileAsync("lsof", ["-ti", `:${port}`]);
+    return stdout
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(Number)
+      .filter((n) => Number.isInteger(n));
+  } catch {
+    // lsof exits non-zero when no process owns the port — that's fine.
+    return [];
+  }
+}
+
+/**
+ * Pre-flight a port before launching `bal run`. Distinguishes processes WE
+ * started (tracked `bal run` children) from unknown processes:
+ *
+ *   - Free port            → returns { stoppedTracked: [] }.
+ *   - Held by tracked runs → stops them (it's a stale run of our own service),
+ *                            waits for the socket to release, returns their PIDs.
+ *   - Held by an UNKNOWN   → throws PRECONDITION_FAILED rather than killing a
+ *     process            process we don't own; the caller surfaces the PID and
+ *                          remediation to the user.
+ */
+export async function ensurePortAvailable(
+  port: number
+): Promise<{ stoppedTracked: number[] }> {
+  const holders = await getPortHolders(port);
+  if (holders.length === 0) return { stoppedTracked: [] };
+
+  const tracked = holders.filter((pid) => liveBalRuns.has(pid));
+  const unknown = holders.filter((pid) => !liveBalRuns.has(pid));
+
+  if (unknown.length > 0) {
+    throw new ToolError(
+      "PRECONDITION_FAILED",
+      `Port ${port} is already in use by PID ${unknown.join(", ")} (not started by this server).`,
+      `Stop that process first (e.g. 'kill ${unknown[0]}'), or choose a different port. ` +
+        `If it's a 'bal run' you started in another terminal, press Ctrl+C there.`
+    );
+  }
+
+  // Only our own stale runs hold the port — safe to reclaim.
+  for (const pid of tracked) {
+    stopBalRun(pid);
+  }
+  // Give the OS a moment to release the socket before rebinding.
+  await new Promise((r) => setTimeout(r, 600));
+  return { stoppedTracked: tracked };
+}
+
 export async function balRun(
   projectPath: string,
   port?: number
-): Promise<{ pid: number | undefined; output: string; started: boolean }> {
+): Promise<{ pid: number | undefined; output: string; started: boolean; logFile: string }> {
+  // NOTE: callers must pre-flight the port with ensurePortAvailable() before
+  // calling this. We deliberately do NOT re-check here: stopBalRun() untracks a
+  // PID the instant it signals it, so a second check during the OS's socket-
+  // release window would misclassify our own dying run as an unknown process.
+  const logFile = path.join(os.tmpdir(), `bal-run-${path.basename(projectPath)}-${Date.now()}.log`);
+  const logStream = createWriteStream(logFile, { flags: "a" });
+
   return new Promise((resolve) => {
     const args = ["run"];
     if (port !== undefined) {
-      args.push(`-CservicePort=${port}`);
+      // Configurable overrides must follow a `--` separator, per
+      // `bal run [<package>] [-- -Ckey=value]`. Without it, bal treats
+      // `-CservicePort=…` as a (nonexistent) package path and aborts.
+      args.push("--", `-CservicePort=${port}`);
     }
 
     const proc = spawn(balBin(), args, {
@@ -218,7 +356,7 @@ export async function balRun(
     });
 
     if (proc.pid !== undefined) {
-      liveBalRuns.set(proc.pid, { proc, projectPath });
+      liveBalRuns.set(proc.pid, { proc, projectPath, logFile });
     }
 
     let output = "";
@@ -228,11 +366,17 @@ export async function balRun(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      resolve({ ...result, logFile });
+    };
+
+    const onChunk = (chunk: Buffer) => {
+      const text = chunk.toString();
+      output += text;
+      logStream.write(text);
     };
 
     proc.stdout?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
+      onChunk(chunk);
       if (
         output.includes("Ballerina HTTP(S) listener started") ||
         output.includes("started HTTP/WS listener")
@@ -242,9 +386,7 @@ export async function balRun(
       }
     });
 
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-    });
+    proc.stderr?.on("data", onChunk);
 
     proc.on("error", (err) => {
       if (proc.pid !== undefined) liveBalRuns.delete(proc.pid);
@@ -253,6 +395,7 @@ export async function balRun(
 
     proc.on("exit", (code) => {
       if (proc.pid !== undefined) liveBalRuns.delete(proc.pid);
+      logStream.end();
       proc.unref();
       if (!settled) {
         settle({

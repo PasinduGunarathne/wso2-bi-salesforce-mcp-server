@@ -128,7 +128,16 @@ export function loginUrlFor(baseUrl: string): string {
 }
 
 export function tokenUrlFor(baseUrl: string): string {
-  return `${loginUrlFor(baseUrl)}${SF_TOKEN_PATH}`;
+  // Tokens must be refreshed at the host that issued them. For My Domain orgs
+  // (now the default), that's the org's own instance host — refreshing at
+  // login.salesforce.com can return invalid_grant, and it needlessly depends on
+  // login.salesforce.com resolving. Derive from baseUrl; fall back to login/test
+  // only if it can't be parsed.
+  try {
+    return `${new URL(baseUrl).origin}${SF_TOKEN_PATH}`;
+  } catch {
+    return `${loginUrlFor(baseUrl)}${SF_TOKEN_PATH}`;
+  }
 }
 
 export function authorizeUrlFor(baseUrl?: string): string {

@@ -2,7 +2,7 @@
 
 MCP server that lets AI assistants set up, run, and manage **Ballerina + Salesforce** integrations inside a **WSO2 Integrator (BI)** workspace — from zero credentials to a running REST service in one conversation.
 
-Gives AI assistants **18 tools** to acquire OAuth2 tokens, validate credentials, discover SObjects, scaffold Ballerina projects, add CDC/Platform Event listeners, build, deploy, and stop the integration service — without exposing a shell command interface.
+Gives AI assistants **20 tools** to acquire OAuth2 tokens, validate credentials, discover SObjects, scaffold Ballerina projects, add CDC/Platform Event listeners, build, deploy, and stop the integration service — without exposing a shell command interface.
 
 ---
 
@@ -11,14 +11,60 @@ Gives AI assistants **18 tools** to acquire OAuth2 tokens, validate credentials,
 | Tool | Version | Purpose |
 |------|---------|---------|
 | [Node.js](https://nodejs.org/) | 18+ | Run the MCP server |
-| [Ballerina](https://ballerina.io/downloads/) | 2201.12.0 (Swan Lake) | Build and run Ballerina projects |
+| [Ballerina](https://ballerina.io/downloads/) | `2201.12.0` (Swan Lake) | Build and run the generated projects. Exact match recommended — scaffolded projects pin this distribution, and `sf_check_prerequisites` warns on a mismatch. |
 | [Git](https://git-scm.com/) | Any | Clone the repo |
 | Salesforce org | Any edition | Developer Edition is free — [sign up](https://developer.salesforce.com/signup) |
-| Ballerina `2201.12.0` | Exact match recommended | Scaffolded projects pin this distribution — mismatch will warn at setup |
 
 > **You don't need Salesforce credentials yet.** The MCP tools walk you through creating a Connected App and getting a refresh token.
 >
 > **Salesforce org setting (if using username-password flow):** Setup → Identity → OAuth and OpenID Connect Settings → enable **"Allow OAuth Username-Password Flows"**. This is a one-time 30-second toggle. Not required if using browser OAuth (Path C).
+
+---
+
+## Setup Ballerina + Salesforce — simple steps
+
+From zero to a running integration. Steps 1–2 are one-time; after that `npm run setup` does the rest.
+
+### 1. Install the toolchain
+- **Ballerina** `2201.x` (Swan Lake) — [ballerina.io/downloads](https://ballerina.io/downloads/) (`bal version` to check)
+- **Node.js** 18+
+
+### 2. One-time Salesforce setup (in your org → Setup)
+1. **Create a Connected App** — App Manager → *New Connected App* → enable OAuth:
+   - Callback URL: `https://<your-domain>.my.salesforce.com/services/oauth2/success`
+   - Scopes: **`api`** and **`refresh_token (offline_access)`**
+   - Save, wait 2–10 min, then copy the **Consumer Key** and **Consumer Secret**.
+2. **Disable Refresh Token Rotation** *(do this if you'll run the publisher and CDC together)* — the Connected App → Manage → **Edit Policies → OAuth Policies** → uncheck **"Enable Refresh Token Rotation"** and set **Refresh Token Policy = "Refresh token is valid until revoked"**. With rotation ON, the REST client and the CDC listeners share one refresh token and rotate it out from under each other (`invalid_grant` / `INVALID_SESSION_ID`).
+3. **Enable Change Data Capture** *(only for the consumer/event flow)* — Setup → **Change Data Capture** → add the objects you want events for (e.g. Account). Requires Developer/Enterprise/Unlimited/Performance edition.
+
+### 3. Install + build the MCP server
+```bash
+npm install
+npm run build
+```
+
+### 4. Configure and run
+```bash
+cp .env.example .env     # fill in Consumer Key/Secret, SF_BASE_URL, and one auth option
+chmod 600 .env
+npm run setup            # token → scaffold → bal build → run (live logs in your terminal)
+```
+`npm run setup` obtains a refresh token (refresh token → password → browser OAuth, in that order), scaffolds a Ballerina project under `~/WSO2Integrator/<name>`, runs `bal build`, then launches it in the **foreground with live logs** (Ctrl+C stops it).
+
+Key `.env` knobs:
+
+| Key | Controls |
+|-----|----------|
+| `TARGET_OBJECTS` | Objects exposed as REST CRUD — the **publisher** flow (default `Account,Contact,Lead,Opportunity`). |
+| `CDC_OBJECTS` | Objects you receive change events for — the **consumer** flow. One object = one listener. |
+| `REST_API` | `true` (default) builds the REST publisher API; `false` builds a CDC-only project. |
+
+### 5. What you get
+- **Publisher (REST API):** `GET/POST/PUT/DELETE /<object>` backed by the Salesforce connector — e.g. `curl http://localhost:9090/accounts`.
+- **Consumer (CDC):** listeners that handle create/update/delete/restore events for your `CDC_OBJECTS`.
+- **Self-heal:** if a token expires, open `http://localhost:9090/auth/reauth` once to reauthorize — no restart.
+
+> ⚠️ Running the publisher **and** CDC together requires **Refresh Token Rotation OFF** (step 2.2). They share one refresh token; with rotation on, each invalidates the other.
 
 ---
 
@@ -55,7 +101,7 @@ This compiles TypeScript to `dist/`. The entry point is `dist/index.js`.
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/index.js
 ```
 
-You should see a JSON response listing all 18 tools.
+You should see a JSON response listing all 20 tools.
 
 ---
 
@@ -103,7 +149,7 @@ Replace `/absolute/path/to/wso2-bi-salesforce-mcp-server` with the actual path o
    }
    ```
 
-3. Restart Claude Desktop. The 18 tools will appear automatically.
+3. Restart Claude Desktop. The 20 tools will appear automatically.
 
 ---
 
@@ -270,6 +316,86 @@ Add to `~/.config/zed/settings.json`:
 
 ---
 
+### OpenAI Codex CLI
+
+Codex stores MCP servers in `~/.codex/config.toml` (TOML, not JSON). Add a `[mcp_servers.<name>]` block:
+
+```toml
+[mcp_servers.ballerina-salesforce]
+command = "node"
+args = ["/absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js"]
+```
+
+Or use the CLI (recent Codex versions):
+
+```bash
+codex mcp add ballerina-salesforce -- node /absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js
+```
+
+> ⚠️ Codex uses `mcp_servers` (with an underscore) — every other client in this guide uses `mcpServers` (camelCase). Restart Codex or start a new session after editing.
+
+---
+
+### Gemini CLI (Google)
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ballerina-salesforce": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js"
+      ]
+    }
+  }
+}
+```
+
+Run `/mcp` inside a Gemini CLI session to confirm the server connected and list its tools.
+
+---
+
+### Cline (VS Code extension)
+
+In VS Code, open the **Cline** panel → **MCP Servers** → **Configure MCP Servers**. That opens `cline_mcp_settings.json` — add:
+
+```json
+{
+  "mcpServers": {
+    "ballerina-salesforce": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js"
+      ]
+    }
+  }
+}
+```
+
+The server appears in Cline's MCP Servers list once saved.
+
+---
+
+### Goose, JetBrains AI Assistant, Warp & others
+
+Any client that speaks MCP over stdio works — point it at `node <abs-path>/dist/index.js`. For example, **Goose** uses `~/.config/goose/config.yaml` (or `goose configure` → *Add Extension* → *Command-line Extension*):
+
+```yaml
+extensions:
+  ballerina-salesforce:
+    type: stdio
+    cmd: node
+    args:
+      - /absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js
+    enabled: true
+```
+
+For JetBrains AI Assistant, Warp, and similar tools, use their "Add MCP server" UI with the command/args from the [generic client](#any-mcp-compatible-client-generic) section below.
+
+---
+
 ### HTTP mode (any agent)
 
 Run the server as an HTTP endpoint — useful for remote agents, containers, or any client that supports HTTP-based MCP.
@@ -292,6 +418,42 @@ The server uses **stdio transport** — the standard for local MCP servers.
 - **Args:** `["/absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js"]`
 - **Transport:** `stdio`
 - **Protocol:** JSON-RPC 2.0 over stdin/stdout
+
+---
+
+## One-shot setup script (`.env` → running service)
+
+Prefer to configure everything once and run a single command, instead of feeding values to the assistant one prompt at a time? Use the `.env`-driven setup script. It drives the MCP server programmatically through the full pipeline — **obtain a refresh token (if needed) → `sf_quickstart` (validate + scaffold + build) → `sf_deploy_project`** — reusing the exact same tool logic, with no AI in the loop.
+
+The script gets a refresh token three ways, in order of preference:
+1. **`SF_REFRESH_TOKEN`** in `.env` — used directly, fully non-interactive.
+2. **`SF_USERNAME` + `SF_PASSWORD`** — password flow (needs the org toggle); if it fails, the script **automatically falls back to browser OAuth**.
+3. **Neither set (or pass `--browser`)** — **interactive browser OAuth**: the script builds the auth URL against your My Domain host, **opens your browser**, you approve and paste the `?code=` (or the full redirect URL) back into the terminal, and it exchanges + **writes `SF_REFRESH_TOKEN` into `.env`** so future runs need no browser.
+
+```bash
+cp .env.example .env     # fill in your Salesforce config
+chmod 600 .env           # it holds secrets
+npm run setup            # or: ./setup.sh   (also installs + builds if needed)
+```
+
+**`.env` keys** (see `.env.example` for the annotated template):
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `SF_CLIENT_ID` / `SF_CLIENT_SECRET` | ✅ | Connected App Consumer Key / Secret |
+| `SF_BASE_URL` | ✅ | e.g. `https://myorg.my.salesforce.com` |
+| `SF_REFRESH_TOKEN` | one of these | Pre-obtained refresh token (works on any org) |
+| `SF_USERNAME` + `SF_PASSWORD` | one of these | Used to auto-obtain a token via the password flow (needs the org toggle) |
+| `PROJECT_NAME`, `ORG_NAME`, `BI_PATH`, `TARGET_OBJECTS`, `PORT`, `SANDBOX`, `BUILD` | — | Optional; sensible defaults applied |
+
+**Flags:**
+- `npm run setup -- --browser` — force the interactive browser OAuth flow (skip token/password).
+- `npm run setup -- --no-deploy` — stop after build; start it yourself later.
+- `npm run setup -- --no-build` — scaffold only, skip `bal build`.
+
+**Auth tips:** the `SF_REFRESH_TOKEN` path works on any org. The password path is fully hands-off but needs *Setup → Identity → OAuth and OpenID Connect Settings → Allow OAuth Username-Password Flows* enabled — if it isn't, the script falls back to browser OAuth automatically. The browser path also works on any org (no toggle), and after the first run your token is saved to `.env` so it's non-interactive thereafter.
+
+> The MCP server stays useful after this for conversational, iterative work — adding objects, CDC listeners, inspecting schemas. The script just automates the initial end-to-end setup.
 
 ---
 
@@ -569,7 +731,7 @@ Verifies the `bal` CLI is installed and reports its version vs. the expected Bal
 "What version of Ballerina do I have?"
 ```
 
-No parameters. Returns: `bal_cli.available`, `bal_cli.version`, `platform`, `recommended_action`.
+No parameters. Returns: `bal_cli.available`, `bal_cli.version`, `bal_cli.expected_distribution`, `bal_cli.version_match` (and `bal_cli.version_warning` when the installed distribution doesn't match `2201.12.0`), `node_version`, `platform`, `recommended_action`.
 
 ---
 
@@ -578,18 +740,27 @@ No parameters. Returns: `bal_cli.available`, `bal_cli.version`, `platform`, `rec
 #### `sf_get_oauth_auth_url`
 Generates a Salesforce OAuth2 authorization URL. Open it in a browser to approve access — you receive a `?code=` query parameter in the redirect URL.
 
+The generated URL has the form:
+
 ```
-"Get me an OAuth URL for client ID 3MVG9..."
+https://<your-instance>/services/oauth2/authorize?response_type=code&client_id=<CONSUMER_KEY>&redirect_uri=<REDIRECT_URI>&scope=api%20refresh_token%20offline_access
+```
+
+**Pass `sf_base_url`** (your org / My Domain URL) so the authorize endpoint targets **your org's own host** — e.g. `https://myorg.my.salesforce.com/services/oauth2/authorize`. This is the correct host for **My Domain orgs** and avoids "log in via your My Domain" redirects. If you omit `sf_base_url`, the URL falls back to `login.salesforce.com` (or `test.salesforce.com` when `sandbox: true`). The `scope=api refresh_token offline_access` is always included — `offline_access` is what makes Salesforce return a refresh token.
+
+```
+"Get me an OAuth URL for client ID 3MVG9... — my org is https://myorg.my.salesforce.com"
 "Generate a Salesforce authorization URL — this is a sandbox"
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `sf_client_id` | string | **required** | Consumer Key from your Connected App |
-| `redirect_uri` | string | `https://login.salesforce.com/services/oauth2/success` | Must match your Connected App |
-| `sandbox` | boolean | `false` | Use `test.salesforce.com` instead of `login.salesforce.com` |
+| `sf_base_url` | string | — | **Recommended.** Org / My Domain URL. When set, the authorize URL (and the default redirect) use this host. |
+| `redirect_uri` | string | `https://login.salesforce.com/services/oauth2/success` | Must match a callback registered in your Connected App. When `sf_base_url` is set and this is left at the default, it auto-aligns to `<your-host>/services/oauth2/success`. |
+| `sandbox` | boolean | `false` | Use `test.salesforce.com` instead of `login.salesforce.com`. Ignored when `sf_base_url` is set. |
 
-Returns: `auth_url` (open this in a browser), `next_step`.
+Returns: `auth_url` (open this in a browser), `redirect_uri` (the one actually used — pass the same to `sf_exchange_oauth_code`), `next_step`.
 
 ---
 
@@ -814,7 +985,7 @@ Returns: `success`, `output` (full compiler output), `project_path`.
 ---
 
 #### `sf_deploy_project`
-Starts the Ballerina service in the background via `bal run`. Waits up to 20 seconds for the HTTP listener banner. Ports are passed as configurable overrides so the reported `service_url` always matches the actual listener.
+Starts the Ballerina service in the background via `bal run`. Waits up to **90 seconds** for the HTTP listener banner (a cold `bal run` compiles before serving, which can take 30–120s). Ports are passed as configurable overrides so the reported `service_url` always matches the actual listener. The tool only reports an error if the process actually exits — a slow cold start is not treated as failure.
 
 ```
 "Start the Salesforce integration service"
@@ -981,15 +1152,7 @@ Returns: `refresh_token`, `instance_url`, `ready_for_quickstart` block.
 
 Using pre-built types means standard SObjects need zero describe calls during scaffolding — the project generates in seconds regardless of how many standard objects you include.
 
-### Environment variable fallbacks
-
-`main.bal` uses Ballerina `configurable` for all credentials with `os:getEnv()` fallbacks. The same project runs in all environments without code changes:
-
-| Environment | How credentials are supplied |
-|-------------|------------------------------|
-| Local dev | `Config.toml` in project root |
-| Docker / WSO2 BI runtime | `SF_CLIENT_ID`, `SF_CLIENT_SECRET`, `SF_REFRESH_TOKEN`, `SF_REFRESH_URL`, `SF_BASE_URL` env vars |
-| CI | Mix — `Config.toml` wins when present |
+> **Credentials & environment variables** for the generated project are documented in detail in the [Configuration](#configuration) section below.
 
 ---
 
@@ -1034,7 +1197,7 @@ wso2-bi-salesforce-mcp-server/
 │   ├── types.ts                   # Shared TypeScript types, ToolError, error codes, maskSecret
 │   ├── constants.ts               # SF constants, URL validation, sandbox detection, versions
 │   ├── schemas/
-│   │   └── tools.ts               # Zod schemas for all 15 tool inputs
+│   │   └── tools.ts               # Zod schemas for all 20 tool inputs
 │   ├── services/
 │   │   ├── salesforce.ts          # Token management, SObject describe/list, validateConnection
 │   │   ├── filesystem.ts          # writeFile, balBuild, balRun, checkBalCli, expandPath
@@ -1059,14 +1222,64 @@ wso2-bi-salesforce-mcp-server/
 
 ## Configuration
 
-### Environment variables for the MCP server
+There are two distinct layers of configuration: **(1) the MCP server itself** (how the Node process runs) and **(2) the generated Ballerina project** (how the integration authenticates to Salesforce at runtime). They're separate — you rarely touch the server config, while the project config is written for you by the tools.
+
+### 1. MCP server — environment variables
+
+Set these on the `node dist/index.js` process (e.g. in your MCP client config's `env` block, or your shell). All are optional.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRANSPORT` | `stdio` | `stdio` or `http` |
-| `PORT` | `3001` | HTTP listener port (HTTP mode only) |
-| `SF_MCP_HTTP_TOKEN` | — | Bearer token required on all `/mcp` requests (HTTP mode). Strongly recommended. |
-| `BAL_BIN` | `bal` | Absolute path to the `bal` binary — useful when `bal` is installed but not on `PATH`. |
+| `TRANSPORT` | `stdio` | Transport mode: `stdio` (local clients) or `http` (remote/containers). |
+| `PORT` | `3001` | HTTP listener port — **HTTP mode only**. |
+| `SF_MCP_HTTP_TOKEN` | — | Bearer token required on all `/mcp` requests in HTTP mode. The server warns on startup if unset. **Strongly recommended** for any non-localhost use. |
+| `BAL_BIN` | `bal` | Absolute path to the `bal` binary — useful when Ballerina is installed but not on `PATH` (e.g. via bvm). |
+| `SF_MCP_ALLOWED_ROOTS` | `$HOME`, `$TMPDIR` | Colon-separated extra directories that `project_path` / `bi_path` are permitted to resolve under. Add a path here to scaffold outside your home directory. |
+
+Example — pinning a `bal` binary and an extra project root in a Claude Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "ballerina-salesforce": {
+      "command": "node",
+      "args": ["/absolute/path/to/wso2-bi-salesforce-mcp-server/dist/index.js"],
+      "env": {
+        "BAL_BIN": "/Users/me/.ballerina/bin/bal",
+        "SF_MCP_ALLOWED_ROOTS": "/data/projects"
+      }
+    }
+  }
+}
+```
+
+### 2. Generated project — `Config.toml`
+
+Every scaffolded project gets a `Config.toml` in its root, written with **mode `0600`** (owner read/write only) and git-ignored. The MCP tools populate it for you — this reference is for when you want to edit or rotate it by hand. Each key maps to a `configurable` variable in `main.bal`.
+
+| Key | Type | Example | Description |
+|-----|------|---------|-------------|
+| `clientId` | string | `"3MVG9..."` | Connected App Consumer Key. |
+| `clientSecret` | string | `"ABCD..."` | Connected App Consumer Secret. |
+| `refreshToken` | string | `"5Aep861..."` | Long-lived OAuth2 refresh token. The connector mints short-lived access tokens from this at runtime. |
+| `refreshUrl` | string | `"https://login.salesforce.com/services/oauth2/token"` | Token endpoint. Auto-set to `login.` (production) or `test.` (sandbox) based on `sf_base_url`. |
+| `baseUrl` | string | `"https://myorg.my.salesforce.com"` | Your org instance URL. |
+| `apiVersion` | string | `"62.0"` | Salesforce REST API version the connector targets. |
+| `servicePort` | int | `9090` | HTTP listener port for the generated service. |
+
+> To rotate credentials without re-scaffolding, prefer the `sf_write_config_toml` tool — it re-writes the file with mode `0600` and re-detects sandbox vs. production for you.
+
+#### Runtime credential sources (precedence)
+
+`main.bal` reads each credential from `Config.toml` first, falling back to an environment variable if the file value is absent. The same project therefore runs unchanged across environments:
+
+| Environment | How credentials are supplied |
+|-------------|------------------------------|
+| Local dev | `Config.toml` in the project root |
+| Docker / WSO2 BI runtime | Env vars: `SF_CLIENT_ID`, `SF_CLIENT_SECRET`, `SF_REFRESH_TOKEN`, `SF_REFRESH_URL`, `SF_BASE_URL` |
+| CI | Either — `Config.toml` takes precedence when present |
+
+> The port can also be overridden at launch without editing the file: `bal run -CservicePort=8080` (this is exactly what `sf_deploy_project` does with its `port` parameter).
 
 ---
 
@@ -1158,7 +1371,7 @@ The first build downloads `ballerinax/salesforce@8.7.0` from Ballerina Central. 
 The channel `/event/YourEvent__e` must exist in your org before the listener can attach. Create the Platform Event in Salesforce Setup → Platform Events.
 
 ### Service starts but `/health` returns connection refused
-The 20-second startup window elapsed before the listener banner was detected. The service may still be starting — wait a few seconds and retry. Check the `output` field in the `sf_deploy_project` result for error messages.
+The 90-second startup window elapsed before the listener banner was detected — a cold `bal run` compiles before serving. The service may still be starting; wait a few more seconds and retry. Check the `output` field in the `sf_deploy_project` result for compiler or bind errors.
 
 ### `PATH_TRAVERSAL` error
 Your `project_path` or `bi_path` resolves outside `$HOME` or `$TMPDIR`. Use a path inside your home directory, or run with extra roots:
